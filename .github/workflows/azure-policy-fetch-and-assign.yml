@@ -1,0 +1,104 @@
+name: Azure Policy Fetch and Assign
+
+on:
+  workflow_dispatch:
+    inputs:
+      selected_initiative:
+        description: 'Enter the compliance initiative name (e.g., nist_sp_800_53_r4)'
+        required: true
+      selected_policy:
+        description: 'Enter the policy file name (e.g., audit-vm-managed-disks.json)'
+        required: true
+      assignment_scope:
+        description: 'Enter Azure scope (e.g., /subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)'
+        required: true
+      assignment_name:
+        description: 'Enter policy assignment name'
+        required: true
+
+jobs:
+  fetch_and_assign:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.10
+
+    - name: Install Python Dependencies
+      run: |
+        pip install beautifulsoup4 requests
+
+    - name: Fetch Azure Built-in Compliance Policies
+      run: |
+        python - <<EOF
+        import requests
+        from bs4 import BeautifulSoup
+        import os
+        import re
+
+        BASE_URL = "https://learn.microsoft.com"
+        SAMPLES_PAGE = "https://learn.microsoft.com/en-us/azure/governance/policy/samples"
+
+        def fetch_initiatives():
+            response = requests.get(SAMPLES_PAGE)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            links = soup.select("a[href$='.json']")
+            initiatives = {}
+
+            for link in links:
+                href = link['href']
+                full_url = BASE_URL + href
+                text = link.text.strip()
+
+                match = re.search(r'initiatives/(.+?)/(.+?\.json)', href)
+                if match:
+                    initiative_name = match.group(1).replace('-', '_')
+                    policy_filename = match.group(2)
+                    initiatives.setdefault(initiative_name, []).append((policy_filename, full_url))
+
+            return initiatives
+
+        def save_policies(initiatives):
+            os.makedirs('azure_compliance_policies', exist_ok=True)
+            for initiative, policies in initiatives.items():
+                initiative_path = os.path.join("azure_compliance_policies", initiative)
+                os.makedirs(initiative_path, exist_ok=True)
+                for filename, url in policies:
+                    response = requests.get(url)
+                    file_path = os.path.join(initiative_path, filename)
+                    with open(file_path, 'w') as f:
+                        f.write(response.text)
+
+        def list_initiatives(initiatives):
+            print("\nAvailable Compliance Initiatives and Policies:\n")
+            for i, (initiative, policies) in enumerate(initiatives.items(), start=1):
+                print(f"{i}. {initiative}")
+                for j, (filename, _) in enumerate(policies, start=1):
+                    print(f"    {j}. {filename}")
+
+        initiatives = fetch_initiatives()
+        list_initiatives(initiatives)
+        save_policies(initiatives)
+        print("\n✅ Policies downloaded to 'azure_compliance_policies/'")
+        EOF
+
+    - name: Login to Azure (OIDC)
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Assign Selected Policy to Azure
+      run: |
+        echo "Assigning Policy: ${{ github.event.inputs.selected_policy }} from Initiative: ${{ github.event.inputs.selected_initiative }}"
+        echo "Using Scope: ${{ github.event.inputs.assignment_scope }}"
+        az policy assignment create \
+          --name "${{ github.event.inputs.assignment_name }}" \
+          --scope "${{ github.event.inputs.assignment_scope }}" \
+          --policy "azure_compliance_policies/${{ github.event.inputs.selected_initiative }}/${{ github.event.inputs.selected_policy }}"
